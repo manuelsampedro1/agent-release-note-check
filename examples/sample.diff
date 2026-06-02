@@ -1,0 +1,37 @@
+diff --git a/src/auth/session.py b/src/auth/session.py
+index 1111111..2222222 100644
+--- a/src/auth/session.py
++++ b/src/auth/session.py
+@@ -1,5 +1,8 @@
+ def refresh_session(token):
+-    return token
++    if token.is_expired:
++        raise ValueError("expired token")
++    return token.rotate()
+diff --git a/requirements.txt b/requirements.txt
+index 1111111..2222222 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1 +1 @@
+-requests==2.31.0
++requests==2.32.0
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 1111111..2222222 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -5,4 +5,5 @@ jobs:
+     steps:
+       - uses: actions/checkout@v4
++      - run: make smoke
+diff --git a/tests/test_session.py b/tests/test_session.py
+index 1111111..2222222 100644
+--- a/tests/test_session.py
++++ b/tests/test_session.py
+@@ -1,3 +1,6 @@
+ def test_refresh_session():
+-    assert True
++    assert refresh_session(active_token)
++
++def test_rejects_expired_token():
++    assert raises_expired(expired_token)
+

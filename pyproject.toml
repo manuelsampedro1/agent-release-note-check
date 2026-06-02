@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-release-note-check"
+version = "0.1.0"
+description = "Audit release notes against the diff they claim to describe."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Manuel Sampedro" }]
+
+[project.scripts]
+agent-release-note-check = "agent_release_note_check.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
