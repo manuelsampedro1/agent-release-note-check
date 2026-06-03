@@ -6,6 +6,8 @@ This is a dependency-free Python 3.9+ CLI for maintainers who use coding agents
 to prepare changelogs, release notes, or PR-to-release summaries. It does not
 call a model or publish anything. It reads a release note and a unified diff,
 then reports whether important change categories are missing or overstated.
+Optionally, it can verify an `agent-proof-packet.v1` file against the same diff
+before accepting packet checks as evidence for strong verification claims.
 
 ## Why
 
@@ -37,6 +39,12 @@ Audit notes against a diff:
 agent-release-note-check examples/release-notes.md --diff examples/sample.diff --min-score 80
 ```
 
+Audit notes with packet-backed verification evidence:
+
+```sh
+agent-release-note-check examples/release-notes.md --diff examples/sample.diff --proof-packet examples/proof-packet.json
+```
+
 Emit JSON:
 
 ```sh
@@ -64,10 +72,15 @@ agent-release-note-check examples/weak-release-notes.md --diff examples/sample.d
 - Dependency manifest or lockfile changes without dependency notes.
 - CI, workflow, script, or automation changes without operational notes.
 - Test changes without verification or test notes.
+- Proof packets with incomplete verdicts, missing checks, missing evidence, or
+  changed files that do not match the audited diff.
 - Code changes described as docs-only.
 - Unsupported claims such as "fully tested", "no breaking changes", or "no
   security impact" when the note lacks evidence or the diff contradicts the
   claim.
+
+Proof packets only support verification evidence. They do not suppress
+breaking-change, security, dependency, CI, docs-only, or contradiction findings.
 
 ## Output
 
@@ -77,6 +90,7 @@ Markdown output includes:
 - changed-file summary,
 - findings with severity and evidence,
 - release-note coverage hints,
+- verified proof-packet status and passing checks when provided,
 - reviewer follow-up checks.
 
 JSON output exposes the same shape for automation.
@@ -98,4 +112,3 @@ make lint
 make build
 make smoke
 ```
-

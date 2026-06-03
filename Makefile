@@ -10,5 +10,4 @@ build:
 	python3 -m compileall -q src tests
 
 smoke:
-	PYTHONPATH=src python3 -m agent_release_note_check examples/release-notes.md --diff examples/sample.diff --min-score 80
-
+	PYTHONPATH=src python3 -m agent_release_note_check examples/release-notes.md --diff examples/sample.diff --proof-packet examples/proof-packet.json --min-score 80

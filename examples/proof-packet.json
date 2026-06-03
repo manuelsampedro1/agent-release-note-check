@@ -1,0 +1,37 @@
+{
+  "schema_version": "agent-proof-packet.v1",
+  "title": "Release note verification evidence",
+  "verdict": "complete",
+  "changed_files": [
+    {
+      "path": "src/auth/session.py",
+      "summary": "Reject expired tokens before session refresh."
+    },
+    {
+      "path": "requirements.txt",
+      "summary": "Refresh dependency pin for the release."
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "summary": "Run release smoke tests in CI."
+    },
+    {
+      "path": "tests/test_session.py",
+      "summary": "Cover active and expired token refresh behavior."
+    }
+  ],
+  "checks": [
+    {
+      "name": "make test",
+      "status": "pass",
+      "detail": "unit suite passed"
+    },
+    {
+      "name": "GitHub Actions CI",
+      "status": "pass",
+      "detail": "release workflow passed"
+    }
+  ],
+  "missing_evidence": [],
+  "open_questions": []
+}

@@ -21,6 +21,8 @@ CODE_RE = re.compile(r"\.(py|js|ts|tsx|jsx|go|rs|java|kt|swift|rb|php|cs|cpp|c|h
 DELETED_FILE_RE = re.compile(r"^deleted file mode ", re.M)
 REMOVED_PUBLIC_RE = re.compile(r"^-\s*(class|def|function|export|public|interface|type)\b", re.M)
 VERSION_HEADING_RE = re.compile(r"(^|\n)#{1,3}\s*(v?\d+\.\d+|\d{4}-\d{2}-\d{2}|release|version|changelog)", re.I)
+PASS_CHECK_STATUSES = {"pass", "passed", "success", "ok"}
+FAIL_CHECK_STATUSES = {"fail", "failed", "failure", "error", "blocked"}
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,24 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class ProofPacketIssue:
+    severity: str
+    code: str
+    message: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class ProofPacketSummary:
+    path: str
+    status: str
+    verdict: str
+    changed_files: list[str]
+    passing_checks: list[str]
+    issues: list[ProofPacketIssue]
+
+
+@dataclass(frozen=True)
 class ReleaseReport:
     status: str
     score: int
@@ -48,6 +68,7 @@ class ReleaseReport:
     changed_files: list[ChangedFile]
     findings: list[Finding]
     coverage_terms: list[str]
+    proof_packets: list[ProofPacketSummary]
     follow_up_checks: list[str]
 
 
@@ -97,6 +118,13 @@ def parse_changed_files(diff_text: str) -> list[ChangedFile]:
             removed += 1
     flush()
     return files
+
+
+def clean_diff_path(path: str) -> str:
+    cleaned = path.strip()
+    if cleaned.startswith(("a/", "b/")):
+        return cleaned[2:]
+    return cleaned
 
 
 def tags_for_path(path: str) -> list[str]:
@@ -152,10 +180,115 @@ def diff_has_breaking_signal(diff_text: str, files: Sequence[ChangedFile]) -> bo
     return bool(risky_files)
 
 
-def analyze(notes: str, diff_text: str) -> ReleaseReport:
+def proof_issue(severity: str, code: str, message: str, evidence: str) -> ProofPacketIssue:
+    return ProofPacketIssue(severity, code, message, redact(evidence))
+
+
+def proof_packet_summary(path: Path, status: str, issues: list[ProofPacketIssue]) -> ProofPacketSummary:
+    return ProofPacketSummary(str(path), status, "", [], [], issues)
+
+
+def audit_proof_packet(path: Path, diff_paths: Sequence[str]) -> ProofPacketSummary:
+    issues: list[ProofPacketIssue] = []
+    packet_files: list[str] = []
+    passing_checks: list[str] = []
+    check_statuses: list[str] = []
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return proof_packet_summary(path, "fail", [proof_issue("high", "proof-packet-unreadable", f"Proof packet could not be read: {exc}", str(path))])
+    except json.JSONDecodeError as exc:
+        return proof_packet_summary(path, "fail", [proof_issue("high", "proof-packet-invalid-json", f"Proof packet is not valid JSON: {exc}", str(path))])
+
+    if not isinstance(payload, dict):
+        return proof_packet_summary(path, "fail", [proof_issue("high", "proof-packet-invalid-shape", "Proof packet must be a JSON object.", str(path))])
+
+    if payload.get("schema_version") != "agent-proof-packet.v1":
+        issues.append(proof_issue("high", "proof-packet-wrong-schema", "Proof packet schema_version is not agent-proof-packet.v1.", str(path)))
+
+    verdict = str(payload.get("verdict", "")).strip()
+    if verdict != "complete":
+        issues.append(proof_issue("high", "proof-packet-incomplete", f"Proof packet verdict is {verdict or 'missing'}, not complete.", str(path)))
+
+    raw_changed_files = payload.get("changed_files")
+    if not isinstance(raw_changed_files, list) or not raw_changed_files:
+        issues.append(proof_issue("high", "proof-packet-missing-changed-files", "Proof packet has no changed-file evidence.", str(path)))
+    else:
+        for item in raw_changed_files:
+            if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"].strip():
+                packet_files.append(clean_diff_path(item["path"]))
+            else:
+                issues.append(proof_issue("high", "proof-packet-invalid-changed-file", "Proof packet contains an invalid changed_files entry.", str(path)))
+
+    raw_checks = payload.get("checks")
+    if not isinstance(raw_checks, list) or not raw_checks:
+        issues.append(proof_issue("high", "proof-packet-missing-checks", "Proof packet has no checks.", str(path)))
+    else:
+        for item in raw_checks:
+            if not isinstance(item, dict):
+                issues.append(proof_issue("high", "proof-packet-invalid-check", "Proof packet contains an invalid check entry.", str(path)))
+                continue
+            name = str(item.get("name", "")).strip()
+            status = str(item.get("status", "")).strip().lower()
+            detail = str(item.get("detail", "")).strip()
+            if not name or not status:
+                issues.append(proof_issue("high", "proof-packet-invalid-check", "Proof packet contains a nameless or statusless check.", str(path)))
+                continue
+            check_statuses.append(status)
+            if status in PASS_CHECK_STATUSES:
+                passing_checks.append(name + (f" - {detail}" if detail else ""))
+            elif status not in FAIL_CHECK_STATUSES:
+                issues.append(proof_issue("medium", "proof-packet-unknown-check-status", f"Proof packet check `{name}` uses an unrecognized status.", status))
+
+    if any(status in FAIL_CHECK_STATUSES for status in check_statuses):
+        issues.append(proof_issue("high", "proof-packet-failing-checks", "Proof packet includes failing checks.", str(path)))
+    if not any(status in PASS_CHECK_STATUSES for status in check_statuses):
+        issues.append(proof_issue("high", "proof-packet-no-passing-checks", "Proof packet has no passing checks.", str(path)))
+
+    missing_evidence = payload.get("missing_evidence")
+    if isinstance(missing_evidence, list) and missing_evidence:
+        issues.append(proof_issue("high", "proof-packet-missing-evidence", "Proof packet still has missing evidence.", ", ".join(str(item) for item in missing_evidence[:5])))
+    elif missing_evidence is not None and not isinstance(missing_evidence, list):
+        issues.append(proof_issue("high", "proof-packet-invalid-missing-evidence", "Proof packet missing_evidence must be a list when present.", str(path)))
+
+    open_questions = payload.get("open_questions")
+    if isinstance(open_questions, list) and open_questions:
+        issues.append(proof_issue("medium", "proof-packet-open-questions", "Proof packet still has open questions.", ", ".join(str(item) for item in open_questions[:5])))
+    elif open_questions is not None and not isinstance(open_questions, list):
+        issues.append(proof_issue("medium", "proof-packet-invalid-open-questions", "Proof packet open_questions should be a list when present.", str(path)))
+
+    diff_file_set = {clean_diff_path(path) for path in diff_paths}
+    packet_file_set = set(packet_files)
+    if diff_file_set and packet_file_set and diff_file_set != packet_file_set:
+        issues.append(
+            proof_issue(
+                "high",
+                "proof-packet-diff-mismatch",
+                "Proof packet changed files do not match the provided diff.",
+                f"diff={sorted(diff_file_set)} packet={sorted(packet_file_set)}",
+            )
+        )
+
+    status = "fail" if any(issue.severity == "high" for issue in issues) else "pass"
+    return ProofPacketSummary(str(path), status, verdict, packet_files, passing_checks, issues)
+
+
+def analyze(notes: str, diff_text: str, proof_packets: Sequence[ProofPacketSummary] | None = None) -> ReleaseReport:
     findings: list[Finding] = []
     files = parse_changed_files(diff_text)
     notes_clean = notes.strip()
+    proof_packet_list = list(proof_packets or [])
+    passing_proof_checks = [
+        check
+        for packet in proof_packet_list
+        if packet.status == "pass"
+        for check in packet.passing_checks
+    ]
+
+    for packet in proof_packet_list:
+        for issue in packet.issues:
+            findings.append(Finding(issue.severity, issue.code, packet.path, issue.message, issue.evidence))
 
     if not notes_clean:
         findings.append(Finding("critical", "empty-release-notes", "release-notes", "Release notes are empty.", ""))
@@ -173,6 +306,8 @@ def analyze(notes: str, diff_text: str) -> ReleaseReport:
     for tag in changed_tags:
         if tag_covered([tag], notes_clean):
             coverage_terms.append(tag)
+    if passing_proof_checks:
+        coverage_terms.append("proof-packet")
 
     for file in files:
         if "docs" in file.tags and len(file.tags) == 1:
@@ -211,7 +346,8 @@ def analyze(notes: str, diff_text: str) -> ReleaseReport:
     if notes_include(notes_clean, ("no breaking changes", "no breaking change")) and diff_has_breaking_signal(diff_text, files):
         findings.append(Finding("high", "no-breaking-claim-contradicted", "release-notes", "Release notes claim no breaking changes but diff has breaking-change signals.", "breaking signal"))
 
-    if notes_include(notes_clean, ("fully tested", "all tests passed", "100% tested")) and not notes_include(notes_clean, ("make test", "ci", "github actions", "pytest", "unittest", "npm test")):
+    has_named_test_evidence = notes_include(notes_clean, ("make test", "ci", "github actions", "pytest", "unittest", "npm test")) or bool(passing_proof_checks)
+    if notes_include(notes_clean, ("fully tested", "all tests passed", "100% tested")) and not has_named_test_evidence:
         findings.append(Finding("medium", "test-claim-without-evidence", "release-notes", "Release notes claim strong test coverage without naming evidence.", "test claim"))
 
     if notes_include(notes_clean, ("no security impact", "no security changes")) and any("security" in file.tags for file in files):
@@ -230,6 +366,7 @@ def analyze(notes: str, diff_text: str) -> ReleaseReport:
         changed_files=files,
         findings=findings,
         coverage_terms=coverage_terms,
+        proof_packets=proof_packet_list,
         follow_up_checks=follow_up_checks,
     )
 
@@ -273,6 +410,15 @@ def render_markdown(report: ReleaseReport) -> str:
             lines.append(f"- `{file.path}` +{file.added}/-{file.removed}; tags: {tags}")
     lines.extend(["", "## Coverage Terms", ""])
     lines.append("- " + (", ".join(report.coverage_terms) if report.coverage_terms else "none"))
+    lines.extend(["", "## Proof Packets", ""])
+    if not report.proof_packets:
+        lines.append("- none")
+    else:
+        for packet in report.proof_packets:
+            checks = ", ".join(packet.passing_checks) if packet.passing_checks else "none"
+            lines.append(f"- `{packet.path}` status: {packet.status}; verdict: {packet.verdict or 'unknown'}; passing checks: {checks}")
+            for issue in packet.issues:
+                lines.append(f"- [{issue.severity}] {issue.code}: {issue.message} Evidence: `{issue.evidence}`")
     lines.extend(["", "## Follow-Up Checks", ""])
     for check in report.follow_up_checks:
         lines.append(f"- {check}")
@@ -295,6 +441,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("release_notes", type=Path, help="Markdown release notes or changelog draft.")
     parser.add_argument("--diff", required=True, type=Path, help="Unified diff for the release scope.")
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown", help="Output format.")
+    parser.add_argument("--proof-packet", action="append", default=[], type=Path, help="Optional agent-proof-packet.v1 JSON evidence to verify against the diff.")
     parser.add_argument("--write-report", type=Path, help="Optional path to write the rendered report.")
     parser.add_argument("--min-score", type=int, default=0, help="Fail when score is below this value.")
     parser.add_argument("--fail-on", choices=("none", "low", "medium", "high", "critical"), default="high", help="Fail when a finding at or above this severity is present.")
@@ -303,7 +450,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    report = analyze(read_text(args.release_notes), read_text(args.diff))
+    diff_text = read_text(args.diff)
+    diff_paths = [file.path for file in parse_changed_files(diff_text)]
+    proof_packets = [audit_proof_packet(path, diff_paths) for path in args.proof_packet]
+    report = analyze(read_text(args.release_notes), diff_text, proof_packets)
     output = report_to_json(report) if args.format == "json" else render_markdown(report)
     if args.write_report:
         args.write_report.write_text(output, encoding="utf-8")
@@ -313,4 +463,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

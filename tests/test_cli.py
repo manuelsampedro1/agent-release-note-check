@@ -7,7 +7,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
-from agent_release_note_check.cli import analyze, main, parse_changed_files
+from agent_release_note_check.cli import analyze, audit_proof_packet, main, parse_changed_files, report_to_json
 
 
 SAMPLE_DIFF = """diff --git a/src/auth/session.py b/src/auth/session.py
@@ -44,6 +44,9 @@ index 1111111..2222222 100644
 """
 
 
+SAMPLE_CHANGED_FILES = ["src/auth/session.py", "requirements.txt", ".github/workflows/ci.yml", "tests/test_session.py"]
+
+
 GOOD_NOTES = """# v0.4.0
 
 ## Changed
@@ -69,10 +72,38 @@ class ReleaseNoteCheckTests(unittest.TestCase):
         with redirect_stdout(StringIO()):
             return main(args)
 
+    def run_main_output(self, args: list[str]) -> tuple[int, str]:
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            code = main(args)
+        return code, stdout.getvalue()
+
+    def write_proof_packet(
+        self,
+        root: Path,
+        *,
+        changed_files: list[str] | None = None,
+        verdict: str = "complete",
+        checks: list[dict[str, str]] | None = None,
+        missing_evidence: list[str] | None = None,
+    ) -> Path:
+        payload = {
+            "schema_version": "agent-proof-packet.v1",
+            "title": "Release verification evidence",
+            "verdict": verdict,
+            "changed_files": [{"path": path} for path in (changed_files or SAMPLE_CHANGED_FILES)],
+            "checks": checks or [{"name": "make test", "status": "pass", "detail": "unit suite passed"}],
+            "missing_evidence": missing_evidence or [],
+            "open_questions": [],
+        }
+        path = root / "proof-packet.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
     def test_parse_changed_files(self) -> None:
         files = parse_changed_files(SAMPLE_DIFF)
 
-        self.assertEqual([file.path for file in files], ["src/auth/session.py", "requirements.txt", ".github/workflows/ci.yml", "tests/test_session.py"])
+        self.assertEqual([file.path for file in files], SAMPLE_CHANGED_FILES)
         self.assertIn("security", files[0].tags)
         self.assertIn("dependency", files[1].tags)
         self.assertIn("operations", files[2].tags)
@@ -122,6 +153,48 @@ deleted file mode 100644
 
         self.assertTrue(any(finding.rule == "test-claim-without-evidence" for finding in report.findings))
 
+    def test_proof_packet_supplies_test_claim_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes = "# v0.4.0\n\nSecurity auth dependency workflow test update. Fully tested."
+            proof = audit_proof_packet(self.write_proof_packet(root), SAMPLE_CHANGED_FILES)
+            report = analyze(notes, SAMPLE_DIFF, [proof])
+
+        self.assertFalse(any(finding.rule == "test-claim-without-evidence" for finding in report.findings))
+        self.assertEqual(report.proof_packets[0].status, "pass")
+        self.assertIn("proof-packet", report.coverage_terms)
+
+    def test_incomplete_proof_packet_fails_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes_path = root / "notes.md"
+            diff_path = root / "change.diff"
+            notes_path.write_text(GOOD_NOTES, encoding="utf-8")
+            diff_path.write_text(SAMPLE_DIFF, encoding="utf-8")
+            proof_path = self.write_proof_packet(root, verdict="incomplete", missing_evidence=["CI run URL"])
+
+            code, output = self.run_main_output([str(notes_path), "--diff", str(diff_path), "--proof-packet", str(proof_path), "--format", "json"])
+
+        payload = json.loads(output)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["proof_packets"][0]["status"], "fail")
+        self.assertTrue(any(finding["rule"] == "proof-packet-incomplete" for finding in payload["findings"]))
+
+    def test_proof_packet_must_match_diff_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes_path = root / "notes.md"
+            diff_path = root / "change.diff"
+            notes_path.write_text(GOOD_NOTES, encoding="utf-8")
+            diff_path.write_text(SAMPLE_DIFF, encoding="utf-8")
+            proof_path = self.write_proof_packet(root, changed_files=["src/auth/session.py"])
+
+            code, output = self.run_main_output([str(notes_path), "--diff", str(diff_path), "--proof-packet", str(proof_path), "--format", "json"])
+
+        payload = json.loads(output)
+        self.assertEqual(code, 1)
+        self.assertTrue(any(issue["code"] == "proof-packet-diff-mismatch" for issue in payload["proof_packets"][0]["issues"]))
+
     def test_cli_json_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -146,10 +219,11 @@ deleted file mode 100644
 
     def test_json_output_shape(self) -> None:
         report = analyze(GOOD_NOTES, SAMPLE_DIFF)
-        payload = json.loads(json.dumps({"status": report.status, "score": report.score, "changed_file_count": report.changed_file_count}))
+        payload = json.loads(report_to_json(report))
 
         self.assertEqual(payload["status"], "pass")
         self.assertEqual(payload["changed_file_count"], 4)
+        self.assertEqual(payload["proof_packets"], [])
 
 
 if __name__ == "__main__":
